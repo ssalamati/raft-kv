@@ -1,0 +1,132 @@
+// raft_kv.proto - wire protocol for raft-kv.
+//
+// Two services are hosted on ONE gRPC port per node:
+//   RaftService : node -> node   (consensus; Raft paper, Figure 2)
+//   KVService   : client -> node (API of the replicated state machine)
+//
+// Section references (§) are to Ongaro & Ousterhout,
+// "In Search of an Understandable Consensus Algorithm (Extended Version)".
+
+syntax = "proto3";
+
+package raftkv;
+
+// ============================================================================
+// Replicated log
+// ============================================================================
+
+// A state-machine command. Replicated through the log and, once committed,
+// applied to RocksDB.
+message Command {
+  enum Type {
+    NOOP = 0;    // Appended by a new leader so it can commit entries from
+                 // earlier terms (§5.4.2, §8). Applying it does nothing.
+    PUT = 1;
+    DELETE = 2;
+  }
+  Type type = 1;
+  string key = 2;
+  bytes value = 3;  // Only meaningful for PUT.
+}
+
+message LogEntry {
+  uint64 term = 1;     // Term in which the leader created the entry.
+  uint64 index = 2;    // 1-based log position. Index 0 means "empty log".
+  Command command = 3;
+}
+
+// ============================================================================
+// RaftService - node-to-node RPCs
+// ============================================================================
+
+service RaftService {
+  // Invoked by candidates to gather votes (§5.2, §5.4.1).
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+
+  // Invoked by the leader to replicate log entries (§5.3); doubles as the
+  // heartbeat when `entries` is empty.
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+}
+
+message RequestVoteRequest {
+  uint64 term = 1;            // Candidate's term.
+  uint32 candidate_id = 2;    // Candidate requesting the vote.
+  uint64 last_log_index = 3;  // Index of the candidate's last log entry.
+  uint64 last_log_term = 4;   // Term of the candidate's last log entry.
+}
+
+message RequestVoteResponse {
+  uint64 term = 1;            // Responder's currentTerm, so the candidate can step down.
+  bool vote_granted = 2;
+}
+
+message AppendEntriesRequest {
+  uint64 term = 1;                // Leader's term.
+  uint32 leader_id = 2;           // So followers can redirect clients.
+  uint64 prev_log_index = 3;      // Index of the entry immediately preceding the new ones.
+  uint64 prev_log_term = 4;       // Term of the prev_log_index entry.
+  repeated LogEntry entries = 5;  // Empty for heartbeat.
+  uint64 leader_commit = 6;       // Leader's commitIndex.
+}
+
+message AppendEntriesResponse {
+  uint64 term = 1;            // Responder's currentTerm, so the leader can step down.
+  bool success = 2;           // True if the follower matched prev_log_index/prev_log_term.
+
+  // Optional fast-backup hint (§5.3, last paragraph); not part of Figure 2.
+  // Meaningful only when success == false. The index at which the leader
+  // should retry: the follower's log length + 1 if its log is too short,
+  // otherwise the first index of the conflicting term. A leader that ignores
+  // this can simply decrement next_index by one.
+  uint64 conflict_index = 3;
+}
+
+// ============================================================================
+// KVService - client-facing RPCs
+// ============================================================================
+
+service KVService {
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
+
+enum KVStatus {
+  KV_OK = 0;
+  KV_NOT_FOUND = 1;   // Get only. Delete of a missing key is KV_OK (idempotent).
+  KV_NOT_LEADER = 2;  // Node is not the leader; retry at `leader_hint`.
+  KV_TIMEOUT = 3;     // Leader could not commit in time (lost leadership or
+                      // no quorum). For writes the outcome is unknown.
+  KV_ERROR = 4;       // Unexpected internal error (e.g. storage failure).
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  KVStatus status = 1;
+  // Set on KV_NOT_LEADER: the leader's address exactly as listed in --peers.
+  // Empty if this node does not currently know a leader (e.g. mid-election).
+  string leader_hint = 2;
+  bytes value = 3;  // Set when status == KV_OK.
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2;
+}
+
+message PutResponse {
+  KVStatus status = 1;
+  string leader_hint = 2;
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  KVStatus status = 1;
+  string leader_hint = 2;
+}
