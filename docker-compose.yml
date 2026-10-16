@@ -1,0 +1,51 @@
+# Static 3-node raft-kv cluster.
+#
+#   docker compose up --build -d
+#   docker compose run --rm client put mykey myval     # runs inside the cluster network
+#   docker compose run --rm client get mykey
+#
+# From the host machine instead (leader hints carry Docker service names, which
+# the host cannot resolve, so --hint_host swaps in a name it can):
+#   ./build/raft_client --server=localhost:50051 --hint_host=localhost put mykey myval
+#
+# Every node gets the same --peers list. Nodes reach each other by service name
+# on the compose network; each listens on its own port, which is also published
+# to the host under the same number.
+x-peers: &peers "--peers=1:node1:50051,2:node2:50052,3:node3:50053"
+
+x-node: &node
+  image: raft-kv:latest
+  build: .
+  init: true                  # Forwards SIGTERM so `docker compose stop` shuts nodes down cleanly.
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *node
+    command: ["--id=1", "--port=50051", "--db_path=/data", *peers]
+    ports: ["50051:50051"]
+    volumes: ["node1-data:/data"]
+
+  node2:
+    <<: *node
+    command: ["--id=2", "--port=50052", "--db_path=/data", *peers]
+    ports: ["50052:50052"]
+    volumes: ["node2-data:/data"]
+
+  node3:
+    <<: *node
+    command: ["--id=3", "--port=50053", "--db_path=/data", *peers]
+    ports: ["50053:50053"]
+    volumes: ["node3-data:/data"]
+
+  # One-shot CLI client; only started explicitly via `docker compose run --rm client ...`.
+  client:
+    image: raft-kv:latest
+    build: .
+    profiles: ["tools"]
+    entrypoint: ["raft_client", "--server=node1:50051,node2:50052,node3:50053"]
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
